@@ -125,11 +125,53 @@ pub const CronConfig = struct {
     max_run_history: u32 = 50,
 };
 
+// ── Telegram Group Policy ───────────────────────────────────────
+
+pub const TelegramGroupPolicy = enum {
+    /// Respond to all messages in groups.
+    open,
+    /// Only respond when @mentioned or replied to.
+    mention_only,
+    /// Don't respond in groups at all.
+    disabled,
+};
+
+// ── TTS Provider ───────────────────────────────────────────────
+
+pub const TtsProvider = enum {
+    none,
+    openai,
+};
+
 // ── Channel configs ─────────────────────────────────────────────
 
 pub const TelegramConfig = struct {
     bot_token: []const u8,
     allowed_users: []const []const u8 = &.{},
+
+    // ── Group chat settings ──
+    /// Policy for group chats. Default: mention_only (respond only when @mentioned or replied to).
+    group_policy: TelegramGroupPolicy = .mention_only,
+    /// Allowed group chat IDs. Empty = allow all groups where the bot is added.
+    allowed_groups: []const []const u8 = &.{},
+    /// Bot username (without @) for mention detection. Auto-detected via getMe if null.
+    bot_username: ?[]const u8 = null,
+
+    // ── Image settings ──
+    /// Whether to process incoming photos via vision-capable LLM.
+    image_recognition: bool = true,
+    /// Maximum number of photos to process per message (Telegram sends multiple sizes).
+    max_image_size_bytes: u32 = 5_242_880, // 5MB
+
+    // ── Voice/TTS settings ──
+    /// TTS provider for generating voice responses.
+    tts_provider: TtsProvider = .none,
+    /// Voice name for TTS (provider-dependent, e.g. "alloy", "nova", "shimmer" for OpenAI).
+    tts_voice: []const u8 = "alloy",
+    /// TTS speech speed (0.25–4.0 for OpenAI).
+    tts_speed: f64 = 1.0,
+    /// Whether to auto-reply with voice when the user sends a voice message.
+    voice_reply_to_voice: bool = false,
 };
 
 pub const DiscordConfig = struct {

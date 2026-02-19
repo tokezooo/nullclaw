@@ -142,6 +142,31 @@ pub const SessionManager = struct {
         return response;
     }
 
+    /// Process a message with an attached image within a session context.
+    /// Uses the agent's turnWithImage method for multimodal processing.
+    pub fn processMessageWithImage(
+        self: *SessionManager,
+        session_key: []const u8,
+        content: []const u8,
+        image_base64: []const u8,
+        media_type: []const u8,
+    ) ![]const u8 {
+        const session = try self.getOrCreate(session_key);
+
+        session.mutex.lock();
+        defer session.mutex.unlock();
+
+        const response = try session.agent.turnWithImage(content, image_base64, media_type);
+        session.turn_count += 1;
+        session.last_active = std.time.timestamp();
+
+        if (session.agent.last_turn_compacted) {
+            session.last_consolidated = @intCast(@max(0, std.time.timestamp()));
+        }
+
+        return response;
+    }
+
     /// Number of active sessions.
     pub fn sessionCount(self: *SessionManager) usize {
         self.mutex.lock();

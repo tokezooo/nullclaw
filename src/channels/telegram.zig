@@ -161,6 +161,15 @@ pub fn parseAttachmentMarkers(allocator: std.mem.Allocator, text: []const u8) !P
     };
 }
 
+/// Base64-encode binary data using standard alphabet.
+fn base64Encode(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+    const Encoder = std.base64.standard.Encoder;
+    const encoded_len = Encoder.calcSize(data.len);
+    const buf = try allocator.alloc(u8, encoded_len);
+    _ = Encoder.encode(buf, data);
+    return buf;
+}
+
 fn parseMarkerKind(kind_str: []const u8) ?AttachmentKind {
     if (eqlLower(kind_str, "image") or eqlLower(kind_str, "photo")) return .image;
     if (eqlLower(kind_str, "document") or eqlLower(kind_str, "file")) return .document;
@@ -218,13 +227,34 @@ pub const SmartSplitIterator = struct {
     }
 };
 
+const config_types = @import("../config_types.zig");
+
 /// Telegram channel — uses the Bot API with long-polling (getUpdates).
+/// Supports DMs and group chats with configurable policies.
 /// Splits messages at 4096 chars (Telegram limit).
 pub const TelegramChannel = struct {
     allocator: std.mem.Allocator,
     bot_token: []const u8,
     allowed_users: []const []const u8,
     last_update_id: i64,
+    /// Group chat policy.
+    group_policy: config_types.TelegramGroupPolicy,
+    /// Allowed group IDs (empty = all groups allowed).
+    allowed_groups: []const []const u8,
+    /// Bot username for mention detection (without @).
+    bot_username: ?[]const u8,
+    /// Whether to process incoming photos.
+    image_recognition: bool,
+    /// TTS provider.
+    tts_provider: config_types.TtsProvider,
+    /// TTS voice name.
+    tts_voice: []const u8,
+    /// TTS speed.
+    tts_speed: f64,
+    /// Auto voice-reply to voice messages.
+    voice_reply_to_voice: bool,
+    /// Max image size in bytes.
+    max_image_size_bytes: u32,
 
     pub const MAX_MESSAGE_LEN: usize = 4096;
 
@@ -234,6 +264,34 @@ pub const TelegramChannel = struct {
             .bot_token = bot_token,
             .allowed_users = allowed_users,
             .last_update_id = 0,
+            .group_policy = .mention_only,
+            .allowed_groups = &.{},
+            .bot_username = null,
+            .image_recognition = true,
+            .tts_provider = .none,
+            .tts_voice = "alloy",
+            .tts_speed = 1.0,
+            .voice_reply_to_voice = false,
+            .max_image_size_bytes = 5_242_880,
+        };
+    }
+
+    /// Init from full TelegramConfig.
+    pub fn initFromConfig(allocator: std.mem.Allocator, cfg: config_types.TelegramConfig) TelegramChannel {
+        return .{
+            .allocator = allocator,
+            .bot_token = cfg.bot_token,
+            .allowed_users = cfg.allowed_users,
+            .last_update_id = 0,
+            .group_policy = cfg.group_policy,
+            .allowed_groups = cfg.allowed_groups,
+            .bot_username = cfg.bot_username,
+            .image_recognition = cfg.image_recognition,
+            .tts_provider = cfg.tts_provider,
+            .tts_voice = cfg.tts_voice,
+            .tts_speed = cfg.tts_speed,
+            .voice_reply_to_voice = cfg.voice_reply_to_voice,
+            .max_image_size_bytes = cfg.max_image_size_bytes,
         };
     }
 
@@ -283,6 +341,323 @@ pub const TelegramChannel = struct {
     pub fn healthCheck(_: *TelegramChannel) bool {
         // Would normally call getMe; just return true for now
         return true;
+    }
+
+    // ── Group chat helpers ──────────────────────────────────────────
+
+    /// Detect if a chat is a group (group, supergroup, or channel).
+    pub fn isGroupChat(chat_type: []const u8) bool {
+        return std.mem.eql(u8, chat_type, "group") or
+            std.mem.eql(u8, chat_type, "supergroup") or
+            std.mem.eql(u8, chat_type, "channel");
+    }
+
+    /// Check if a group chat ID is allowed (empty allowlist = all allowed).
+    pub fn isGroupAllowed(self: *const TelegramChannel, chat_id: []const u8) bool {
+        if (self.allowed_groups.len == 0) return true; // empty = all allowed
+        for (self.allowed_groups) |gid| {
+            if (std.mem.eql(u8, gid, "*")) return true;
+            if (std.mem.eql(u8, gid, chat_id)) return true;
+        }
+        return false;
+    }
+
+    /// Check if the bot was mentioned in the message text or entities.
+    /// Checks:
+    /// 1. @bot_username in text
+    /// 2. reply_to_message from the bot (implicit mention)
+    /// 3. mention entities pointing to the bot
+    pub fn isBotMentioned(
+        self: *const TelegramChannel,
+        text: []const u8,
+        message: std.json.Value,
+    ) bool {
+        const username = self.bot_username orelse return false;
+
+        // 1. Check for @username in text (case-insensitive)
+        if (text.len > 0) {
+            // Build @username pattern
+            var at_buf: [128]u8 = undefined;
+            if (username.len + 1 <= at_buf.len) {
+                at_buf[0] = '@';
+                @memcpy(at_buf[1 .. username.len + 1], username);
+                const at_name = at_buf[0 .. username.len + 1];
+                // Simple case-insensitive search
+                var i: usize = 0;
+                while (i + at_name.len <= text.len) {
+                    if (std.ascii.eqlIgnoreCase(text[i .. i + at_name.len], at_name)) {
+                        return true;
+                    }
+                    i += 1;
+                }
+            }
+        }
+
+        // 2. Check reply_to_message — if the reply is to a bot message
+        if (message.object.get("reply_to_message")) |reply| {
+            if (reply.object.get("from")) |from| {
+                if (from.object.get("is_bot")) |is_bot| {
+                    if (is_bot == .bool and is_bot.bool) {
+                        if (from.object.get("username")) |ru| {
+                            if (ru == .string and std.ascii.eqlIgnoreCase(ru.string, username)) {
+                                return true;
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        // 3. Check entities for mention type
+        if (message.object.get("entities")) |entities_val| {
+            if (entities_val == .array) {
+                for (entities_val.array.items) |entity| {
+                    if (entity.object.get("type")) |etype| {
+                        if (etype == .string and std.mem.eql(u8, etype.string, "mention")) {
+                            // Extract mention text from message
+                            const offset_val = entity.object.get("offset") orelse continue;
+                            const length_val = entity.object.get("length") orelse continue;
+                            if (offset_val != .integer or length_val != .integer) continue;
+                            const offset: usize = @intCast(@max(0, offset_val.integer));
+                            const length: usize = @intCast(@max(0, length_val.integer));
+                            if (offset + length <= text.len) {
+                                const mention = text[offset..][0..length];
+                                // mention includes '@', so compare without it
+                                if (mention.len > 1 and mention[0] == '@') {
+                                    if (std.ascii.eqlIgnoreCase(mention[1..], username)) {
+                                        return true;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return false;
+    }
+
+    /// Strip @bot_username mentions from the message text.
+    pub fn stripBotMention(self: *const TelegramChannel, allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+        const username = self.bot_username orelse return try allocator.dupe(u8, text);
+        if (text.len == 0) return try allocator.dupe(u8, text);
+
+        // Build @username pattern
+        var at_buf: [128]u8 = undefined;
+        if (username.len + 1 > at_buf.len) return try allocator.dupe(u8, text);
+        at_buf[0] = '@';
+        @memcpy(at_buf[1 .. username.len + 1], username);
+        const at_name = at_buf[0 .. username.len + 1];
+
+        var result: std.ArrayListUnmanaged(u8) = .empty;
+        errdefer result.deinit(allocator);
+
+        var i: usize = 0;
+        while (i < text.len) {
+            if (i + at_name.len <= text.len and std.ascii.eqlIgnoreCase(text[i .. i + at_name.len], at_name)) {
+                // Skip the mention
+                i += at_name.len;
+                // Skip trailing space
+                if (i < text.len and text[i] == ' ') i += 1;
+            } else {
+                try result.append(allocator, text[i]);
+                i += 1;
+            }
+        }
+
+        const trimmed = std.mem.trim(u8, result.items, " \t\n\r");
+        const owned = try allocator.dupe(u8, trimmed);
+        result.deinit(allocator);
+        return owned;
+    }
+
+    /// Fetch bot username via getMe API (best-effort, called once on start).
+    pub fn fetchBotUsername(self: *TelegramChannel, allocator: std.mem.Allocator) void {
+        if (self.bot_username != null) return; // already set
+
+        var url_buf: [512]u8 = undefined;
+        const url = self.apiUrl(&url_buf, "getMe") catch return;
+
+        const resp = root.http_util.curlPost(allocator, url, "{}", &.{}) catch return;
+        defer allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch return;
+        defer parsed.deinit();
+
+        const result_obj = parsed.value.object.get("result") orelse return;
+        const username_val = result_obj.object.get("username") orelse return;
+        if (username_val != .string) return;
+
+        self.bot_username = allocator.dupe(u8, username_val.string) catch return;
+        log.info("bot username detected: @{s}", .{self.bot_username.?});
+    }
+
+    // ── Photo download ─────────────────────────────────────────────
+
+    /// Download a Telegram photo and return it as base64-encoded data.
+    /// Returns null on failure.
+    pub fn downloadPhotoAsBase64(self: *TelegramChannel, allocator: std.mem.Allocator, file_id: []const u8) ?[]const u8 {
+        // 1. Get file path via getFile API
+        const tg_file_path = getFilePathInternal(allocator, self.bot_token, file_id) catch return null;
+        defer allocator.free(tg_file_path);
+
+        // 2. Download file
+        var url_buf: [1024]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&url_buf);
+        fbs.writer().print("https://api.telegram.org/file/bot{s}/{s}", .{ self.bot_token, tg_file_path }) catch return null;
+        const url = fbs.getWritten();
+
+        const data = root.http_util.curlGet(allocator, url, &.{}, "30") catch return null;
+        defer allocator.free(data);
+
+        // Check file size
+        if (data.len > self.max_image_size_bytes) {
+            log.warn("photo too large: {d} bytes (max {d})", .{ data.len, self.max_image_size_bytes });
+            return null;
+        }
+
+        // 3. Base64 encode
+        return base64Encode(allocator, data) catch return null;
+    }
+
+    /// Helper: get file path from Telegram API.
+    fn getFilePathInternal(allocator: std.mem.Allocator, bot_token: []const u8, file_id: []const u8) ![]u8 {
+        var url_buf: [512]u8 = undefined;
+        var fbs = std.io.fixedBufferStream(&url_buf);
+        try fbs.writer().print("https://api.telegram.org/bot{s}/getFile", .{bot_token});
+        const url = fbs.getWritten();
+
+        var body_list: std.ArrayListUnmanaged(u8) = .empty;
+        defer body_list.deinit(allocator);
+        try body_list.appendSlice(allocator, "{\"file_id\":");
+        try root.json_util.appendJsonString(&body_list, allocator, file_id);
+        try body_list.appendSlice(allocator, "}");
+
+        const resp = try root.http_util.curlPost(allocator, url, body_list.items, &.{});
+        defer allocator.free(resp);
+
+        const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp, .{}) catch
+            return error.InvalidResponse;
+        defer parsed.deinit();
+
+        const result_v = parsed.value.object.get("result") orelse return error.InvalidResponse;
+        const fp_val = result_v.object.get("file_path") orelse return error.InvalidResponse;
+        if (fp_val != .string) return error.InvalidResponse;
+        return try allocator.dupe(u8, fp_val.string);
+    }
+
+    // ── Send voice message ─────────────────────────────────────────
+
+    /// Send a voice message (audio file) to a Telegram chat.
+    /// The file_path should point to an OGG/Opus file for Telegram voice bubbles.
+    pub fn sendVoiceMessage(self: *TelegramChannel, chat_id: []const u8, file_path: []const u8) !void {
+        self.sendMediaMultipart(chat_id, self.allocator, .voice, file_path, null) catch |err| {
+            log.err("sendVoiceMessage failed: {}", .{err});
+            return err;
+        };
+    }
+
+    /// Generate TTS audio from text and send as a voice message.
+    /// Returns true if voice was sent, false if TTS is not available.
+    pub fn sendTtsReply(self: *TelegramChannel, chat_id: []const u8, text: []const u8) bool {
+        if (self.tts_provider == .none) return false;
+
+        const voice_path = voice.textToSpeech(self.allocator, text, .{
+            .provider = switch (self.tts_provider) {
+                .openai => .openai,
+                .none => return false,
+            },
+            .voice = self.tts_voice,
+            .speed = self.tts_speed,
+            .format = "opus",
+        }) catch |err| {
+            log.warn("TTS generation failed: {}", .{err});
+            return false;
+        };
+        defer {
+            std.fs.deleteFileAbsolute(voice_path) catch {};
+            self.allocator.free(voice_path);
+        }
+
+        self.sendVoiceMessage(chat_id, voice_path) catch |err| {
+            log.warn("sendVoiceMessage failed: {}", .{err});
+            return false;
+        };
+        return true;
+    }
+
+    // ── Send message to group with reply ─────────────────────────────
+
+    /// Send a message as a reply to a specific message in a group.
+    pub fn sendReplyMessage(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to_message_id: ?i64) !void {
+        if (reply_to_message_id == null) {
+            return self.sendMessage(chat_id, text);
+        }
+
+        // Send typing indicator (best-effort)
+        self.sendTypingIndicator(chat_id);
+
+        // Parse attachment markers
+        const parsed = try parseAttachmentMarkers(self.allocator, text);
+        defer parsed.deinit(self.allocator);
+
+        // Send remaining text (if any) with smart splitting
+        if (parsed.remaining_text.len > 0) {
+            var it = smartSplitMessage(parsed.remaining_text, MAX_MESSAGE_LEN);
+            var first_chunk = true;
+            while (it.next()) |chunk| {
+                if (first_chunk) {
+                    try self.sendWithReply(chat_id, chunk, reply_to_message_id.?);
+                    first_chunk = false;
+                } else {
+                    try self.sendWithMarkdownFallback(chat_id, chunk);
+                }
+            }
+        }
+
+        // Send attachments
+        for (parsed.attachments) |att| {
+            self.sendMediaMultipart(chat_id, self.allocator, att.kind, att.target, att.caption) catch |err| {
+                log.err("sendMediaMultipart failed: {}", .{err});
+                continue;
+            };
+        }
+    }
+
+    fn sendWithReply(self: *TelegramChannel, chat_id: []const u8, text: []const u8, reply_to_id: i64) !void {
+        var url_buf: [512]u8 = undefined;
+        const url = try self.apiUrl(&url_buf, "sendMessage");
+
+        const html_text = markdownToTelegramHtml(self.allocator, text) catch {
+            try self.sendChunkPlain(chat_id, text);
+            return;
+        };
+        defer self.allocator.free(html_text);
+
+        var body: std.ArrayListUnmanaged(u8) = .empty;
+        defer body.deinit(self.allocator);
+
+        try body.appendSlice(self.allocator, "{\"chat_id\":");
+        try body.appendSlice(self.allocator, chat_id);
+        try body.appendSlice(self.allocator, ",\"text\":");
+        try root.json_util.appendJsonString(&body, self.allocator, html_text);
+        try body.appendSlice(self.allocator, ",\"parse_mode\":\"HTML\"");
+        // Add reply_to_message_id
+        var reply_buf: [64]u8 = undefined;
+        const reply_str = std.fmt.bufPrint(&reply_buf, ",\"reply_to_message_id\":{d}", .{reply_to_id}) catch "";
+        try body.appendSlice(self.allocator, reply_str);
+        try body.appendSlice(self.allocator, "}");
+
+        const resp = root.http_util.curlPost(self.allocator, url, body.items, &.{}) catch {
+            try self.sendChunkPlain(chat_id, text);
+            return;
+        };
+        defer self.allocator.free(resp);
+
+        if (std.mem.indexOf(u8, resp, "\"error_code\"") != null) {
+            try self.sendChunkPlain(chat_id, text);
+        }
     }
 
     // ── Typing indicator ────────────────────────────────────────────
@@ -487,9 +862,13 @@ pub const TelegramChannel = struct {
 
     /// Poll for updates using long-polling (getUpdates) via curl.
     /// Returns a slice of ChannelMessages allocated on the given allocator.
+    /// Supports both DM and group chats with configurable policies.
     /// Voice and audio messages are automatically transcribed via Groq Whisper
-    /// when GROQ_API_KEY is set.
+    /// when GROQ_API_KEY is set. Photos are optionally downloaded and base64-encoded.
     pub fn pollUpdates(self: *TelegramChannel, allocator: std.mem.Allocator) ![]root.ChannelMessage {
+        // Auto-detect bot username on first poll
+        self.fetchBotUsername(allocator);
+
         var url_buf: [512]u8 = undefined;
         const url = try self.apiUrl(&url_buf, "getUpdates");
 
@@ -532,7 +911,43 @@ pub const TelegramChannel = struct {
                 break :blk_uid std.fmt.bufPrint(&user_id_buf, "{d}", .{id_val.integer}) catch null;
             };
 
-            // Check allowlist against all known identities
+            // Get chat info
+            const chat_obj = message.object.get("chat") orelse continue;
+            const chat_id_val = chat_obj.object.get("id") orelse continue;
+            var chat_id_buf: [32]u8 = undefined;
+            const chat_id_str = blk_cid: {
+                if (chat_id_val == .integer) {
+                    break :blk_cid std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch continue;
+                }
+                continue;
+            };
+
+            // Detect chat type (private, group, supergroup, channel)
+            const chat_type_val = chat_obj.object.get("type");
+            const chat_type = if (chat_type_val) |ctv| (if (ctv == .string) ctv.string else "private") else "private";
+            const is_group = isGroupChat(chat_type);
+
+            // Get message_thread_id for forum topics
+            var thread_id_buf: [32]u8 = undefined;
+            const thread_id: ?[]const u8 = blk_tid: {
+                const tid_val = message.object.get("message_thread_id") orelse break :blk_tid null;
+                if (tid_val != .integer) break :blk_tid null;
+                break :blk_tid std.fmt.bufPrint(&thread_id_buf, "{d}", .{tid_val.integer}) catch null;
+            };
+
+            // ── Access control ──
+            if (is_group) {
+                // Check group policy
+                if (self.group_policy == .disabled) continue;
+
+                // Check group allowlist
+                if (!self.isGroupAllowed(chat_id_str)) {
+                    log.debug("ignoring message from disallowed group: {s}", .{chat_id_str});
+                    continue;
+                }
+            }
+
+            // Check user allowlist (applies to both DMs and groups)
             var ids_buf: [2][]const u8 = undefined;
             var ids_len: usize = 0;
             ids_buf[ids_len] = username;
@@ -541,12 +956,38 @@ pub const TelegramChannel = struct {
                 ids_buf[ids_len] = uid;
                 ids_len += 1;
             }
-            if (!self.isAnyIdentityAllowed(ids_buf[0..ids_len])) {
-                log.warn("ignoring message from unauthorized user: username={s}, user_id={s}", .{
-                    username,
-                    user_id orelse "unknown",
-                });
-                continue;
+            // In groups with open/mention_only policy, allow all users
+            // Only check allowlist for DMs or groups with no open policy
+            if (!is_group or self.allowed_users.len > 0) {
+                if (!is_group and !self.isAnyIdentityAllowed(ids_buf[0..ids_len])) {
+                    log.warn("ignoring DM from unauthorized user: username={s}, user_id={s}", .{
+                        username,
+                        user_id orelse "unknown",
+                    });
+                    continue;
+                }
+            }
+
+            // ── Extract text content ──
+            const raw_text: []const u8 = blk_txt: {
+                if (message.object.get("text")) |tv| {
+                    if (tv == .string) break :blk_txt tv.string;
+                }
+                if (message.object.get("caption")) |cv| {
+                    if (cv == .string) break :blk_txt cv.string;
+                }
+                break :blk_txt "";
+            };
+
+            // ── Mention detection for groups ──
+            const is_mention = if (is_group)
+                self.isBotMentioned(raw_text, message)
+            else
+                false;
+
+            // Apply group mention policy
+            if (is_group and self.group_policy == .mention_only and !is_mention) {
+                continue; // Skip non-mentioned messages in mention_only groups
             }
 
             // Use username as sender identity, fall back to numeric id
@@ -555,53 +996,130 @@ pub const TelegramChannel = struct {
             else
                 (user_id orelse "unknown");
 
-            // Get chat_id
-            const chat_obj = message.object.get("chat") orelse continue;
-            const chat_id_val = chat_obj.object.get("id") orelse continue;
-            var chat_id_buf: [32]u8 = undefined;
-            const chat_id_str = blk: {
-                if (chat_id_val == .integer) {
-                    break :blk std.fmt.bufPrint(&chat_id_buf, "{d}", .{chat_id_val.integer}) catch continue;
+            // ── Build session key ──
+            // DM: "telegram:{user_id_or_chat_id}"
+            // Group: "telegram:group:{chat_id}" or "telegram:group:{chat_id}:thread:{thread_id}"
+            const session_key = blk_sk: {
+                if (is_group) {
+                    if (thread_id) |tid| {
+                        break :blk_sk try std.fmt.allocPrint(allocator, "telegram:group:{s}:thread:{s}", .{ chat_id_str, tid });
+                    } else {
+                        break :blk_sk try std.fmt.allocPrint(allocator, "telegram:group:{s}", .{chat_id_str});
+                    }
+                } else {
+                    break :blk_sk try std.fmt.allocPrint(allocator, "telegram:{s}", .{chat_id_str});
                 }
-                continue;
             };
+            errdefer allocator.free(session_key);
 
-            // Check for voice/audio messages and attempt transcription
-            const content = blk_content: {
+            // ── Check for voice/audio messages and attempt transcription ──
+            var is_voice_msg = false;
+            const voice_content = blk_voice: {
                 const voice_obj = message.object.get("voice") orelse message.object.get("audio");
                 if (voice_obj) |vobj| {
-                    const file_id_val = vobj.object.get("file_id") orelse break :blk_content null;
-                    const file_id = if (file_id_val == .string) file_id_val.string else break :blk_content null;
+                    is_voice_msg = true;
+                    const file_id_val = vobj.object.get("file_id") orelse break :blk_voice null;
+                    const file_id = if (file_id_val == .string) file_id_val.string else break :blk_voice null;
 
                     if (voice.transcribeTelegramVoice(allocator, self.bot_token, file_id)) |transcribed| {
                         // Prepend [Voice]: prefix
                         var result: std.ArrayListUnmanaged(u8) = .empty;
-                        result.appendSlice(allocator, "[Voice]: ") catch break :blk_content null;
+                        result.appendSlice(allocator, "[Voice]: ") catch break :blk_voice null;
                         result.appendSlice(allocator, transcribed) catch {
                             result.deinit(allocator);
-                            break :blk_content null;
+                            break :blk_voice null;
                         };
                         allocator.free(transcribed);
-                        break :blk_content result.toOwnedSlice(allocator) catch null;
+                        break :blk_voice result.toOwnedSlice(allocator) catch null;
                     }
-                    break :blk_content null;
+                    break :blk_voice null;
                 }
-                break :blk_content null;
+                break :blk_voice null;
             };
 
-            // Fall back to text content if no voice transcription
-            const final_content = content orelse blk_text: {
-                const text_val = message.object.get("text") orelse continue;
-                const text_str = if (text_val == .string) text_val.string else continue;
-                break :blk_text try allocator.dupe(u8, text_str);
+            // ── Check for photos ──
+            var image_b64: ?[]const u8 = null;
+            var image_mime: ?[]const u8 = null;
+            if (self.image_recognition) {
+                if (message.object.get("photo")) |photo_val| {
+                    if (photo_val == .array and photo_val.array.items.len > 0) {
+                        // Get the largest photo (last element in the array)
+                        const photos = photo_val.array.items;
+                        const largest = photos[photos.len - 1];
+                        if (largest.object.get("file_id")) |fid| {
+                            if (fid == .string) {
+                                image_b64 = self.downloadPhotoAsBase64(allocator, fid.string);
+                                if (image_b64 != null) {
+                                    image_mime = try allocator.dupe(u8, "image/jpeg");
+                                }
+                            }
+                        }
+                    }
+                }
+                // Also check for sticker
+                if (image_b64 == null) {
+                    if (message.object.get("sticker")) |sticker| {
+                        if (sticker.object.get("file_id")) |fid| {
+                            if (fid == .string) {
+                                image_b64 = self.downloadPhotoAsBase64(allocator, fid.string);
+                                if (image_b64 != null) {
+                                    image_mime = try allocator.dupe(u8, "image/webp");
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            // ── Build final content ──
+            const final_content = blk_final: {
+                if (voice_content) |vc| {
+                    break :blk_final vc;
+                }
+
+                // Strip bot mention from text in groups
+                const clean_text = if (is_group and is_mention)
+                    self.stripBotMention(allocator, raw_text) catch try allocator.dupe(u8, raw_text)
+                else
+                    try allocator.dupe(u8, raw_text);
+
+                // If we have an image but no text, provide a prompt
+                if (clean_text.len == 0 and image_b64 != null) {
+                    allocator.free(clean_text);
+                    break :blk_final try allocator.dupe(u8, "[User sent an image. Please describe what you see.]");
+                }
+
+                if (clean_text.len == 0) {
+                    allocator.free(clean_text);
+                    // No content at all — skip
+                    allocator.free(session_key);
+                    if (image_b64) |ib| allocator.free(ib);
+                    if (image_mime) |im| allocator.free(im);
+                    continue;
+                }
+
+                break :blk_final clean_text;
             };
+
+            // ── Add sender context for groups ──
+            const enriched_content = if (is_group) blk_enrich: {
+                const enriched = try std.fmt.allocPrint(allocator, "[{s}]: {s}", .{ sender_identity, final_content });
+                allocator.free(final_content);
+                break :blk_enrich enriched;
+            } else final_content;
 
             try messages.append(allocator, .{
                 .id = try allocator.dupe(u8, sender_identity),
                 .sender = try allocator.dupe(u8, chat_id_str),
-                .content = final_content,
-                .channel = "telegram",
+                .content = enriched_content,
+                .channel = try allocator.dupe(u8, "telegram"),
                 .timestamp = root.nowEpochSecs(),
+                .session_key = session_key,
+                .is_group = is_group,
+                .is_mention = is_mention,
+                .is_voice = is_voice_msg,
+                .image_base64 = image_b64,
+                .image_mime = image_mime,
             });
         }
 

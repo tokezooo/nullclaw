@@ -264,6 +264,238 @@ fn curlPostFromFile(
 }
 
 // ════════════════════════════════════════════════════════════════════════════
+// Text-to-Speech (TTS)
+// ════════════════════════════════════════════════════════════════════════════
+
+pub const TtsProvider = enum {
+    none,
+    openai,
+};
+
+pub const TtsOptions = struct {
+    provider: TtsProvider = .openai,
+    voice: []const u8 = "alloy",
+    speed: f64 = 1.0,
+    /// Output format: "opus" for Telegram voice bubbles, "mp3" for files.
+    format: []const u8 = "opus",
+};
+
+pub const TtsError = error{
+    NoApiKey,
+    RequestFailed,
+    InvalidResponse,
+} || std.mem.Allocator.Error;
+
+/// Convert text to speech using the configured TTS provider.
+/// Returns the path to the generated audio file (caller must free path and delete file).
+pub fn textToSpeech(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    opts: TtsOptions,
+) TtsError![]const u8 {
+    return switch (opts.provider) {
+        .openai => openaiTts(allocator, text, opts),
+        .none => return error.NoApiKey,
+    };
+}
+
+/// OpenAI TTS API: POST https://api.openai.com/v1/audio/speech
+fn openaiTts(
+    allocator: std.mem.Allocator,
+    text: []const u8,
+    opts: TtsOptions,
+) TtsError![]const u8 {
+    const api_key = std.posix.getenv("OPENAI_API_KEY") orelse return error.NoApiKey;
+
+    // Strip markdown for cleaner speech (remove **, `, #, etc.)
+    const clean_text = stripMarkdownForSpeech(allocator, text) catch text;
+    defer if (clean_text.ptr != text.ptr) allocator.free(clean_text);
+
+    // Truncate to OpenAI TTS limit (4096 chars)
+    const max_tts_len: usize = 4096;
+    const tts_text = if (clean_text.len > max_tts_len) clean_text[0..max_tts_len] else clean_text;
+
+    // Build JSON body
+    var body: std.ArrayListUnmanaged(u8) = .empty;
+    defer body.deinit(allocator);
+
+    body.appendSlice(allocator, "{\"model\":\"tts-1\",\"voice\":\"") catch return error.RequestFailed;
+    body.appendSlice(allocator, opts.voice) catch return error.RequestFailed;
+    body.appendSlice(allocator, "\",\"input\":") catch return error.RequestFailed;
+
+    // JSON-escape the text
+    body.append(allocator, '"') catch return error.RequestFailed;
+    for (tts_text) |c| {
+        switch (c) {
+            '"' => body.appendSlice(allocator, "\\\"") catch return error.RequestFailed,
+            '\\' => body.appendSlice(allocator, "\\\\") catch return error.RequestFailed,
+            '\n' => body.appendSlice(allocator, " ") catch return error.RequestFailed,
+            '\r' => {},
+            '\t' => body.appendSlice(allocator, " ") catch return error.RequestFailed,
+            else => {
+                if (c < 0x20) {
+                    // Skip control characters
+                } else {
+                    body.append(allocator, c) catch return error.RequestFailed;
+                }
+            },
+        }
+    }
+    body.append(allocator, '"') catch return error.RequestFailed;
+
+    body.appendSlice(allocator, ",\"response_format\":\"") catch return error.RequestFailed;
+    body.appendSlice(allocator, opts.format) catch return error.RequestFailed;
+    body.append(allocator, '"') catch return error.RequestFailed;
+
+    // Speed parameter
+    if (opts.speed != 1.0) {
+        var speed_buf: [32]u8 = undefined;
+        const speed_str = std.fmt.bufPrint(&speed_buf, ",\"speed\":{d:.2}", .{opts.speed}) catch "";
+        body.appendSlice(allocator, speed_str) catch return error.RequestFailed;
+    }
+
+    body.append(allocator, '}') catch return error.RequestFailed;
+
+    // Build auth header
+    var auth_buf: [256]u8 = undefined;
+    var auth_fbs = std.io.fixedBufferStream(&auth_buf);
+    auth_fbs.writer().print("Authorization: Bearer {s}", .{api_key}) catch
+        return error.RequestFailed;
+    const auth_hdr = auth_fbs.getWritten();
+
+    // Output temp file
+    const pid = getPid();
+    var tmp_path_buf: [256]u8 = undefined;
+    var tmp_fbs = std.io.fixedBufferStream(&tmp_path_buf);
+    const ext = if (std.mem.eql(u8, opts.format, "opus")) ".ogg" else ".mp3";
+    tmp_fbs.writer().print("/tmp/nullclaw_tts_{d}{s}", .{ pid, ext }) catch
+        return error.RequestFailed;
+    const tmp_path_len = tmp_fbs.pos;
+
+    // Use curl to POST and save response body to file
+    var argv_buf: [32][]const u8 = undefined;
+    var argc: usize = 0;
+    argv_buf[argc] = "curl";
+    argc += 1;
+    argv_buf[argc] = "-s";
+    argc += 1;
+    argv_buf[argc] = "-X";
+    argc += 1;
+    argv_buf[argc] = "POST";
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = auth_hdr;
+    argc += 1;
+    argv_buf[argc] = "-H";
+    argc += 1;
+    argv_buf[argc] = "Content-Type: application/json";
+    argc += 1;
+    argv_buf[argc] = "-d";
+    argc += 1;
+    argv_buf[argc] = body.items;
+    argc += 1;
+    argv_buf[argc] = "-o";
+    argc += 1;
+
+    // Null-terminate tmp_path for output
+    tmp_path_buf[tmp_path_len] = 0;
+    argv_buf[argc] = tmp_path_buf[0..tmp_path_len];
+    argc += 1;
+    argv_buf[argc] = "https://api.openai.com/v1/audio/speech";
+    argc += 1;
+
+    var child = std.process.Child.init(argv_buf[0..argc], allocator);
+    child.stdout_behavior = .Ignore;
+    child.stderr_behavior = .Ignore;
+
+    child.spawn() catch return error.RequestFailed;
+    const term = child.wait() catch return error.RequestFailed;
+    switch (term) {
+        .Exited => |code| if (code != 0) return error.RequestFailed,
+        else => return error.RequestFailed,
+    }
+
+    // Verify file exists and has content
+    {
+        const f = std.fs.openFileAbsolute(tmp_path_buf[0..tmp_path_len :0], .{}) catch return error.RequestFailed;
+        defer f.close();
+        const file_size = f.getEndPos() catch return error.RequestFailed;
+        if (file_size < 100) return error.InvalidResponse; // Too small to be audio
+    }
+
+    return allocator.dupe(u8, tmp_path_buf[0..tmp_path_len]) catch return error.RequestFailed;
+}
+
+/// Strip markdown formatting for cleaner TTS output.
+fn stripMarkdownForSpeech(allocator: std.mem.Allocator, text: []const u8) ![]const u8 {
+    var result: std.ArrayListUnmanaged(u8) = .empty;
+    errdefer result.deinit(allocator);
+
+    var i: usize = 0;
+    while (i < text.len) {
+        // Skip code blocks ```...```
+        if (i + 3 <= text.len and std.mem.eql(u8, text[i .. i + 3], "```")) {
+            i += 3;
+            // Find closing ```
+            while (i + 3 <= text.len) {
+                if (std.mem.eql(u8, text[i .. i + 3], "```")) {
+                    i += 3;
+                    break;
+                }
+                i += 1;
+            }
+            try result.appendSlice(allocator, " [code block omitted] ");
+            continue;
+        }
+        // Skip inline code `...`
+        if (text[i] == '`') {
+            i += 1;
+            while (i < text.len and text[i] != '`') : (i += 1) {
+                try result.append(allocator, text[i]);
+            }
+            if (i < text.len) i += 1; // skip closing `
+            continue;
+        }
+        // Skip bold ** and __
+        if (i + 2 <= text.len and (std.mem.eql(u8, text[i .. i + 2], "**") or std.mem.eql(u8, text[i .. i + 2], "__"))) {
+            i += 2;
+            continue;
+        }
+        // Skip single * and _
+        if ((text[i] == '*' or text[i] == '_') and i + 1 < text.len and text[i + 1] != ' ') {
+            i += 1;
+            continue;
+        }
+        // Skip # headers at line start
+        if (text[i] == '#' and (i == 0 or text[i - 1] == '\n')) {
+            while (i < text.len and text[i] == '#') : (i += 1) {}
+            if (i < text.len and text[i] == ' ') i += 1;
+            continue;
+        }
+        // Skip link markdown [text](url) — keep text
+        if (text[i] == '[') {
+            const close_bracket = std.mem.indexOfPos(u8, text, i, "]") orelse {
+                try result.append(allocator, text[i]);
+                i += 1;
+                continue;
+            };
+            if (close_bracket + 1 < text.len and text[close_bracket + 1] == '(') {
+                // Copy link text, skip URL
+                try result.appendSlice(allocator, text[i + 1 .. close_bracket]);
+                const close_paren = std.mem.indexOfPos(u8, text, close_bracket, ")") orelse close_bracket;
+                i = close_paren + 1;
+                continue;
+            }
+        }
+        try result.append(allocator, text[i]);
+        i += 1;
+    }
+
+    return result.toOwnedSlice(allocator);
+}
+
+// ════════════════════════════════════════════════════════════════════════════
 // Telegram Voice Integration
 // ════════════════════════════════════════════════════════════════════════════
 

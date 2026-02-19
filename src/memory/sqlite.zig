@@ -407,14 +407,50 @@ pub const SqliteMemory = struct {
 
     // ── Internal search helpers ────────────────────────────────────
 
+    /// Temporal decay half-life in seconds (7 days).
+    /// Memories older than this have their relevance score halved.
+    const TEMPORAL_DECAY_HALF_LIFE_SECS: f64 = 7.0 * 24.0 * 3600.0;
+
+    /// Compute temporal decay multiplier: exp(-lambda * age_secs)
+    /// where lambda = ln(2) / half_life.
+    fn temporalDecay(created_timestamp: []const u8) f64 {
+        const now: f64 = @floatFromInt(std.time.timestamp());
+        const created = std.fmt.parseFloat(f64, created_timestamp) catch return 1.0;
+        const age_secs = @max(0.0, now - created);
+        const lambda = 0.693147 / TEMPORAL_DECAY_HALF_LIFE_SECS; // ln(2)
+        return @exp(-lambda * age_secs);
+    }
+
     fn fts5Search(self_: *Self, allocator: std.mem.Allocator, query: []const u8, limit: usize, session_id: ?[]const u8) ![]MemoryEntry {
         // Build FTS5 query: wrap each word in quotes joined by OR
         var fts_query: std.ArrayList(u8) = .empty;
         defer fts_query.deinit(allocator);
 
+        // Filter out common stop words to improve search quality
+        const stop_words = [_][]const u8{
+            "the", "a", "an", "is", "are", "was", "were", "be", "been",
+            "has", "have", "had", "do", "does", "did", "will", "would",
+            "could", "should", "may", "might", "can", "shall",
+            "in", "on", "at", "to", "for", "of", "with", "by", "from",
+            "and", "or", "but", "not", "no", "if", "so", "as", "it",
+            "i", "me", "my", "we", "us", "our", "you", "your",
+            "he", "she", "they", "them", "his", "her", "its", "their",
+            "this", "that", "these", "those", "what", "which", "who",
+        };
+
         var iter = std.mem.tokenizeAny(u8, query, " \t\n\r");
         var first = true;
         while (iter.next()) |word| {
+            // Skip stop words (case-insensitive check)
+            var is_stop = false;
+            for (&stop_words) |sw| {
+                if (word.len == sw.len and std.ascii.eqlIgnoreCase(word, sw)) {
+                    is_stop = true;
+                    break;
+                }
+            }
+            if (is_stop) continue;
+
             if (!first) {
                 try fts_query.appendSlice(allocator, " OR ");
             }
@@ -430,7 +466,31 @@ pub const SqliteMemory = struct {
             first = false;
         }
 
+        if (fts_query.items.len == 0) {
+            // All words were stop words — fall back to original query
+            iter = std.mem.tokenizeAny(u8, query, " \t\n\r");
+            first = true;
+            while (iter.next()) |word| {
+                if (!first) {
+                    try fts_query.appendSlice(allocator, " OR ");
+                }
+                try fts_query.append(allocator, '"');
+                for (word) |ch_byte| {
+                    if (ch_byte == '"') {
+                        try fts_query.appendSlice(allocator, "\"\"");
+                    } else {
+                        try fts_query.append(allocator, ch_byte);
+                    }
+                }
+                try fts_query.append(allocator, '"');
+                first = false;
+            }
+        }
+
         if (fts_query.items.len == 0) return allocator.alloc(MemoryEntry, 0);
+
+        // Fetch more results than needed for post-processing (temporal decay re-ranking)
+        const fetch_limit = limit * 3;
 
         const sql =
             "SELECT m.id, m.key, m.content, m.category, m.created_at, bm25(memories_fts) as score, m.session_id " ++
@@ -449,7 +509,7 @@ pub const SqliteMemory = struct {
         try fts_query.append(allocator, 0);
         const fts_z = fts_query.items[0 .. fts_query.items.len - 1];
         _ = c.sqlite3_bind_text(stmt, 1, fts_z.ptr, @intCast(fts_z.len), SQLITE_STATIC);
-        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(limit));
+        _ = c.sqlite3_bind_int64(stmt, 2, @intCast(fetch_limit));
 
         var entries: std.ArrayList(MemoryEntry) = .empty;
         errdefer {
@@ -462,7 +522,12 @@ pub const SqliteMemory = struct {
             if (rc == c.SQLITE_ROW) {
                 const score_raw = c.sqlite3_column_double(stmt.?, 5);
                 var entry = try readEntryFromRow(stmt.?, allocator);
-                entry.score = -score_raw; // BM25 returns negative (lower = better)
+
+                // Compute combined score: BM25 relevance * temporal decay
+                const bm25_score = -score_raw; // BM25 returns negative (lower = better)
+                const decay = temporalDecay(entry.timestamp);
+                entry.score = bm25_score * decay;
+
                 // Filter by session_id if requested
                 if (session_id) |sid| {
                     if (entry.session_id == null or !std.mem.eql(u8, entry.session_id.?, sid)) {
@@ -472,6 +537,22 @@ pub const SqliteMemory = struct {
                 }
                 try entries.append(allocator, entry);
             } else break;
+        }
+
+        // Re-sort by combined score (descending — higher is better)
+        const items = entries.items;
+        std.mem.sort(MemoryEntry, items, {}, struct {
+            pub fn lessThan(_: void, a: MemoryEntry, b: MemoryEntry) bool {
+                return (b.score orelse 0.0) < (a.score orelse 0.0);
+            }
+        }.lessThan);
+
+        // Trim to requested limit
+        if (items.len > limit) {
+            for (items[limit..]) |*entry| {
+                entry.deinit(allocator);
+            }
+            entries.shrinkRetainingCapacity(limit);
         }
 
         return entries.toOwnedSlice(allocator);

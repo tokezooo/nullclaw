@@ -103,13 +103,32 @@ pub const Agent = struct {
     const OwnedMessage = struct {
         role: providers.Role,
         content: []const u8,
+        /// Optional multimodal content parts (e.g. text + image).
+        content_parts: ?[]const providers.ContentPart = null,
 
         fn deinit(self: *const OwnedMessage, allocator: std.mem.Allocator) void {
             allocator.free(self.content);
+            if (self.content_parts) |parts| {
+                for (parts) |part| {
+                    switch (part) {
+                        .text => |t| allocator.free(t),
+                        .image_url => |u| allocator.free(u),
+                        .image_base64 => |ib| {
+                            allocator.free(ib.media_type);
+                            allocator.free(ib.data);
+                        },
+                    }
+                }
+                allocator.free(parts);
+            }
         }
 
         fn toChatMessage(self: *const OwnedMessage) ChatMessage {
-            return .{ .role = self.role, .content = self.content };
+            return .{
+                .role = self.role,
+                .content = self.content,
+                .content_parts = self.content_parts,
+            };
         }
     };
 
@@ -770,6 +789,175 @@ pub const Agent = struct {
         }
 
         return error.MaxToolIterationsExceeded;
+    }
+
+    /// Execute a conversation turn with an image attached.
+    /// The image is sent as a multimodal content_part alongside the text.
+    /// After the LLM processes it, the image is not stored in history
+    /// (replaced by a text-only summary reference to reduce context usage).
+    pub fn turnWithImage(
+        self: *Agent,
+        user_message: []const u8,
+        image_base64: []const u8,
+        media_type: []const u8,
+    ) ![]const u8 {
+        // Inject system prompt on first turn (same as turn())
+        if (!self.has_system_prompt) {
+            const system_prompt = try prompt.buildSystemPrompt(self.allocator, .{
+                .workspace_dir = self.workspace_dir,
+                .model_name = self.model_name,
+                .tools = self.tools,
+            });
+            defer self.allocator.free(system_prompt);
+
+            const tool_instructions = try dispatcher.buildToolInstructions(self.allocator, self.tools);
+            defer self.allocator.free(tool_instructions);
+
+            const full_system = try self.allocator.alloc(u8, system_prompt.len + tool_instructions.len);
+            @memcpy(full_system[0..system_prompt.len], system_prompt);
+            @memcpy(full_system[system_prompt.len..], tool_instructions);
+
+            try self.history.append(self.allocator, .{
+                .role = .system,
+                .content = full_system,
+            });
+            self.has_system_prompt = true;
+        }
+
+        // Build content parts: text + image
+        const parts = try self.allocator.alloc(providers.ContentPart, 2);
+        errdefer self.allocator.free(parts);
+
+        const text_copy = try self.allocator.dupe(u8, user_message);
+        errdefer self.allocator.free(text_copy);
+        const mime_copy = try self.allocator.dupe(u8, media_type);
+        errdefer self.allocator.free(mime_copy);
+        const data_copy = try self.allocator.dupe(u8, image_base64);
+        errdefer self.allocator.free(data_copy);
+
+        parts[0] = .{ .text = text_copy };
+        parts[1] = .{ .image_base64 = .{ .media_type = mime_copy, .data = data_copy } };
+
+        // Store with content_parts for this message
+        const enriched = if (self.mem) |mem|
+            try memory_loader.enrichMessage(self.allocator, mem, user_message)
+        else
+            try self.allocator.dupe(u8, user_message);
+
+        try self.history.append(self.allocator, .{
+            .role = .user,
+            .content = enriched,
+            .content_parts = parts,
+        });
+
+        // Now run the normal agent loop from here (call provider, handle tool calls, etc.)
+        // Reuse the core loop from turn(), starting from the tool-call loop part.
+        var iter_arena = std.heap.ArenaAllocator.init(self.allocator);
+        defer iter_arena.deinit();
+
+        var iteration: u32 = 0;
+        while (iteration < self.max_tool_iterations) : (iteration += 1) {
+            _ = iter_arena.reset(.retain_capacity);
+            const arena = iter_arena.allocator();
+
+            const messages = blk: {
+                const m = try arena.alloc(ChatMessage, self.history.items.len);
+                for (self.history.items, 0..) |*msg, i| {
+                    m[i] = msg.toChatMessage();
+                }
+                break :blk m;
+            };
+
+            var response = self.provider.chat(
+                self.allocator,
+                .{
+                    .messages = messages,
+                    .model = self.model_name,
+                    .temperature = self.temperature,
+                    .max_tokens = self.max_tokens,
+                    .tools = if (self.tool_specs.len > 0) self.tool_specs else null,
+                },
+                self.model_name,
+                self.temperature,
+            ) catch return error.ProviderFailed;
+
+            const response_text = response.content orelse "";
+
+            const parsed_calls = dispatcher.parseToolCalls(arena, response_text, response.tool_calls) catch &.{};
+
+            if (parsed_calls.len == 0) {
+                // Final text response
+                const final_text = try self.allocator.dupe(u8, response_text);
+                try self.history.append(self.allocator, .{
+                    .role = .assistant,
+                    .content = try self.allocator.dupe(u8, response_text),
+                });
+
+                // After first image turn, strip content_parts from the user message
+                // to reduce context usage in subsequent turns. Replace with text marker.
+                self.stripImageParts();
+
+                self.trimHistory();
+                self.freeResponseFields(&response);
+                return final_text;
+            }
+
+            // Has tool calls — execute them (simplified loop)
+            const assistant_history_content = Agent.buildAssistantHistoryWithToolCalls(
+                arena,
+                response_text,
+                parsed_calls,
+            ) catch response_text;
+
+            try self.history.append(self.allocator, .{
+                .role = .assistant,
+                .content = try self.allocator.dupe(u8, assistant_history_content),
+            });
+
+            // Execute each tool call and collect results
+            var results: std.ArrayListUnmanaged(u8) = .empty;
+            defer results.deinit(arena);
+            const rw = results.writer(arena);
+
+            for (parsed_calls) |call| {
+                const result = self.executeTool(call);
+                try rw.print("<tool_result name=\"{s}\">\n{s}\n</tool_result>\n", .{
+                    call.name, result.output,
+                });
+            }
+
+            try self.history.append(self.allocator, .{
+                .role = .user,
+                .content = try self.allocator.dupe(u8, results.items),
+            });
+
+            self.trimHistory();
+            self.freeResponseFields(&response);
+        }
+
+        return error.MaxToolIterationsExceeded;
+    }
+
+    /// Remove content_parts from user messages in history to reduce context.
+    /// Replaces image content_parts with a text marker.
+    fn stripImageParts(self: *Agent) void {
+        for (self.history.items) |*msg| {
+            if (msg.role == .user and msg.content_parts != null) {
+                const parts = msg.content_parts.?;
+                for (parts) |part| {
+                    switch (part) {
+                        .text => |t| self.allocator.free(t),
+                        .image_url => |u| self.allocator.free(u),
+                        .image_base64 => |ib| {
+                            self.allocator.free(ib.media_type);
+                            self.allocator.free(ib.data);
+                        },
+                    }
+                }
+                self.allocator.free(parts);
+                msg.content_parts = null;
+            }
+        }
     }
 
     /// Execute a tool by name lookup.

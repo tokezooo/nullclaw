@@ -29,6 +29,18 @@ pub const ChannelMessage = struct {
     timestamp: u64,
     /// Where to send a reply (e.g., DM sender vs channel name in IRC, thread ID in Telegram).
     reply_target: ?[]const u8 = null,
+    /// Pre-computed session key (e.g. "telegram:12345" for DM, "telegram:group:-100123" for group).
+    session_key: ?[]const u8 = null,
+    /// Whether this message is from a group/channel (vs. direct message).
+    is_group: bool = false,
+    /// Whether the bot was explicitly mentioned in this message.
+    is_mention: bool = false,
+    /// Whether this message was a voice message (for voice-reply-to-voice).
+    is_voice: bool = false,
+    /// Base64-encoded image data (if message contained a photo).
+    image_base64: ?[]const u8 = null,
+    /// MIME type of the image (e.g. "image/jpeg").
+    image_mime: ?[]const u8 = null,
 
     pub fn deinit(self: *const ChannelMessage, allocator: std.mem.Allocator) void {
         allocator.free(self.id);
@@ -36,6 +48,9 @@ pub const ChannelMessage = struct {
         allocator.free(self.content);
         allocator.free(self.channel);
         if (self.reply_target) |rt| allocator.free(rt);
+        if (self.session_key) |sk| allocator.free(sk);
+        if (self.image_base64) |ib| allocator.free(ib);
+        if (self.image_mime) |im| allocator.free(im);
     }
 };
 

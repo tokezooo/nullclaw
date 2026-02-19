@@ -652,7 +652,7 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         std.process.exit(1);
     };
 
-    const telegram_config = config.channels.telegram orelse {
+    var telegram_config = config.channels.telegram orelse {
         std.debug.print("Telegram not configured. Add to config.json:\n", .{});
         std.debug.print("  \"channels\": {{ \"telegram\": {{ \"bot_token\": \"...\" }} }}\n", .{});
         std.process.exit(1);
@@ -670,10 +670,11 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
             }
         }
     }
-    const allowed: []const []const u8 = if (user_list.items.len > 0)
-        user_list.items
-    else
-        telegram_config.allowed_users;
+    // Apply CLI allowed_users override to config
+    if (user_list.items.len > 0) {
+        telegram_config.allowed_users = user_list.items;
+    }
+    const allowed = telegram_config.allowed_users;
 
     if (config.api_key == null) {
         std.debug.print("No API key in config. Add api_key to ~/.nullclaw/config.json\n", .{});
@@ -699,7 +700,13 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         std.debug.print("\n", .{});
     }
 
-    var tg = yc.channels.telegram.TelegramChannel.init(allocator, telegram_config.bot_token, allowed);
+    // Print group policy
+    std.debug.print("  Group policy: {s}\n", .{@tagName(telegram_config.group_policy)});
+    if (telegram_config.tts_provider != .none) {
+        std.debug.print("  TTS: {s} (voice={s})\n", .{ @tagName(telegram_config.tts_provider), telegram_config.tts_voice });
+    }
+
+    var tg = yc.channels.telegram.TelegramChannel.initFromConfig(allocator, telegram_config);
 
     // Initialize MCP tools from config
     const mcp_tools: ?[]const yc.tools.Tool = if (config.mcp_servers.len > 0)
@@ -789,33 +796,52 @@ fn runChannelStart(allocator: std.mem.Allocator, args: []const []const u8) !void
         };
 
         for (messages) |msg| {
-            std.debug.print("[{s}] {s}: {s}\n", .{ msg.channel, msg.id, msg.content });
+            const group_tag = if (msg.is_group) " [group]" else "";
+            std.debug.print("[{s}{s}] {s}: {s}\n", .{ msg.channel, group_tag, msg.id, msg.content });
 
-            // Session key: "telegram:{chat_id}"
+            // Use pre-computed session key from telegram channel, fallback to basic key
             var key_buf: [128]u8 = undefined;
-            const session_key = std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender;
+            const session_key = msg.session_key orelse
+                (std.fmt.bufPrint(&key_buf, "telegram:{s}", .{msg.sender}) catch msg.sender);
 
-            const reply = session_mgr.processMessage(session_key, msg.content) catch |err| {
-                std.debug.print("  Agent error: {}\n", .{err});
-                tg.sendMessage(msg.sender, "Sorry, I encountered an error.") catch |send_err| log.err("failed to send error reply: {}", .{send_err});
-                continue;
-            };
-            defer allocator.free(reply);
+            // Process with image support if available
+            const reply = if (msg.image_base64 != null)
+                session_mgr.processMessageWithImage(session_key, msg.content, msg.image_base64.?, msg.image_mime orelse "image/jpeg") catch |err| blk: {
+                    std.debug.print("  Agent error (image): {}\n", .{err});
+                    tg.sendMessage(msg.sender, "Sorry, I encountered an error.") catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+                    break :blk null;
+                }
+            else
+                session_mgr.processMessage(session_key, msg.content) catch |err| blk: {
+                    std.debug.print("  Agent error: {}\n", .{err});
+                    tg.sendMessage(msg.sender, "Sorry, I encountered an error.") catch |send_err| log.err("failed to send error reply: {}", .{send_err});
+                    break :blk null;
+                };
 
-            std.debug.print("  -> {s}\n", .{reply});
+            if (reply) |r| {
+                defer allocator.free(r);
+                std.debug.print("  -> {s}\n", .{r});
 
-            // Reply on telegram (sender contains chat_id); handles [IMAGE:path] markers
-            tg.sendMessage(msg.sender, reply) catch |err| {
-                std.debug.print("  Send error: {}\n", .{err});
-            };
+                // If the incoming message was a voice and voice_reply_to_voice is enabled,
+                // try to send a voice reply first, fall back to text
+                const sent_voice = if (msg.is_voice and tg.voice_reply_to_voice)
+                    tg.sendTtsReply(msg.sender, r)
+                else
+                    false;
+
+                if (!sent_voice) {
+                    // Reply on telegram (sender contains chat_id); handles [IMAGE:path] markers
+                    tg.sendMessage(msg.sender, r) catch |err| {
+                        std.debug.print("  Send error: {}\n", .{err});
+                    };
+                }
+            }
         }
 
         if (messages.len > 0) {
-            // Free message memory
-            for (messages) |msg| {
-                allocator.free(msg.id);
-                allocator.free(msg.sender);
-                allocator.free(msg.content);
+            // Free message memory using proper deinit
+            for (messages) |*msg| {
+                msg.deinit(allocator);
             }
             allocator.free(messages);
         }

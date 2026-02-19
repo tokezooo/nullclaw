@@ -671,6 +671,46 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         if (tg.object.get("allowed_users")) |v| {
                             if (v == .array) tg_cfg.allowed_users = try parseStringArray(self.allocator, v.array);
                         }
+                        if (tg.object.get("group_policy")) |v| {
+                            if (v == .string) {
+                                const ct = @import("config_types.zig");
+                                if (std.mem.eql(u8, v.string, "open")) {
+                                    tg_cfg.group_policy = ct.TelegramGroupPolicy.open;
+                                } else if (std.mem.eql(u8, v.string, "mention_only")) {
+                                    tg_cfg.group_policy = ct.TelegramGroupPolicy.mention_only;
+                                } else if (std.mem.eql(u8, v.string, "disabled")) {
+                                    tg_cfg.group_policy = ct.TelegramGroupPolicy.disabled;
+                                }
+                            }
+                        }
+                        if (tg.object.get("allowed_groups")) |v| {
+                            if (v == .array) tg_cfg.allowed_groups = try parseStringArray(self.allocator, v.array);
+                        }
+                        if (tg.object.get("bot_username")) |v| {
+                            if (v == .string) tg_cfg.bot_username = try self.allocator.dupe(u8, v.string);
+                        }
+                        if (tg.object.get("image_recognition")) |v| {
+                            if (v == .bool) tg_cfg.image_recognition = v.bool;
+                        }
+                        if (tg.object.get("tts_provider")) |v| {
+                            if (v == .string) {
+                                const ct = @import("config_types.zig");
+                                if (std.mem.eql(u8, v.string, "openai")) {
+                                    tg_cfg.tts_provider = ct.TtsProvider.openai;
+                                } else {
+                                    tg_cfg.tts_provider = ct.TtsProvider.none;
+                                }
+                            }
+                        }
+                        if (tg.object.get("tts_voice")) |v| {
+                            if (v == .string) tg_cfg.tts_voice = try self.allocator.dupe(u8, v.string);
+                        }
+                        if (tg.object.get("tts_speed")) |v| {
+                            if (v == .float) tg_cfg.tts_speed = v.float;
+                        }
+                        if (tg.object.get("voice_reply_to_voice")) |v| {
+                            if (v == .bool) tg_cfg.voice_reply_to_voice = v.bool;
+                        }
                     }
                 }
             }
