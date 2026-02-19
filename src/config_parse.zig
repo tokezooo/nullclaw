@@ -673,13 +673,12 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (tg.object.get("group_policy")) |v| {
                             if (v == .string) {
-                                const ct = @import("config_types.zig");
                                 if (std.mem.eql(u8, v.string, "open")) {
-                                    tg_cfg.group_policy = ct.TelegramGroupPolicy.open;
+                                    tg_cfg.group_policy = .open;
                                 } else if (std.mem.eql(u8, v.string, "mention_only")) {
-                                    tg_cfg.group_policy = ct.TelegramGroupPolicy.mention_only;
+                                    tg_cfg.group_policy = .mention_only;
                                 } else if (std.mem.eql(u8, v.string, "disabled")) {
-                                    tg_cfg.group_policy = ct.TelegramGroupPolicy.disabled;
+                                    tg_cfg.group_policy = .disabled;
                                 }
                             }
                         }
@@ -694,11 +693,10 @@ pub fn parseJson(self: *Config, content: []const u8) !void {
                         }
                         if (tg.object.get("tts_provider")) |v| {
                             if (v == .string) {
-                                const ct = @import("config_types.zig");
                                 if (std.mem.eql(u8, v.string, "openai")) {
-                                    tg_cfg.tts_provider = ct.TtsProvider.openai;
+                                    tg_cfg.tts_provider = .openai;
                                 } else {
-                                    tg_cfg.tts_provider = ct.TtsProvider.none;
+                                    tg_cfg.tts_provider = .none;
                                 }
                             }
                         }

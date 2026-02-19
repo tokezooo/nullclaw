@@ -843,6 +843,7 @@ pub const Agent = struct {
             try memory_loader.enrichMessage(self.allocator, mem, user_message)
         else
             try self.allocator.dupe(u8, user_message);
+        errdefer self.allocator.free(enriched);
 
         try self.history.append(self.allocator, .{
             .role = .user,

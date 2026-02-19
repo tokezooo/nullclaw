@@ -879,6 +879,7 @@ pub const TelegramChannel = struct {
         const body = fbs.getWritten();
 
         const resp_body = try root.http_util.curlPost(allocator, url, body, &.{});
+        defer allocator.free(resp_body);
 
         // Parse JSON response to extract messages
         const parsed = std.json.parseFromSlice(std.json.Value, allocator, resp_body, .{}) catch return &.{};
